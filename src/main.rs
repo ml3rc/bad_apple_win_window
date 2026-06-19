@@ -27,10 +27,13 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_CLOSE {
-        println!("WM_CLOSE (wnd_proc)");
+    match msg {
+        WM_CLOSE => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcA(hwnd, msg, wparam, lparam),
     }
-    DefWindowProcA(hwnd, msg, wparam, lparam)
 }
 
 fn register_window_class() {
@@ -90,13 +93,13 @@ impl DeferredWindow {
         // takes about 1ms per window
         let hwnd = unsafe {
             CreateWindowExA(
-                // WS_EX_TOPMOST | WS_EX_NOACTIVATE, // Minimize/Maximize/Close
-                // WS_EX_TOPMOST | WS_EX_APPWINDOW, // taskbar, Minimize/Maximize/Close
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // no taskbar, Close button only
+                // WS_EX_TOOLWINDOW keeps the windows out of the taskbar.
+                // WS_POPUP removes the title bar and frame entirely so each
+                // window renders as a plain white rectangle.
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 PCSTR(WND_CLASS.as_ptr() as _),
                 s!("Bad Apple!!"),
-                WS_OVERLAPPEDWINDOW,
-                // WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+                WS_POPUP,
                 // x,y,w,h
                 x,
                 y,
@@ -228,9 +231,6 @@ impl WindowCollection {
     }
 }
 
-// Focus on small binary size: width/height are NonZero so Option<>
-// becomes free!
-#[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct WinCoords {
     x: u8,
@@ -243,6 +243,30 @@ pub struct WinCoords {
 const MAX_WINDOWS: usize = 155;
 const BASE_WIDTH: u8 = 64;
 const BASE_HEIGHT: u8 = 48;
+const TIMER_ID: usize = 1;
+const FRAME_TIMER_MS: u32 = 33;
+
+fn parse_frames(frames_raw: &[u8]) -> Vec<Option<WinCoords>> {
+    let mut chunks = frames_raw.chunks_exact(4);
+    let mut frames = Vec::with_capacity(chunks.len());
+
+    for chunk in &mut chunks {
+        let [x, y, w, h] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let frame = match (NonZeroU8::new(w), NonZeroU8::new(h)) {
+            (None, None) => None,
+            (Some(w), Some(h)) => Some(WinCoords { x, y, w, h }),
+            _ => panic!("invalid frame data: width/height must both be zero or both be non-zero"),
+        };
+        frames.push(frame);
+    }
+
+    assert!(
+        chunks.remainder().is_empty(),
+        "assets/boxes.bin length must be divisible by 4"
+    );
+
+    frames
+}
 
 fn main() {
     commandline_gui_helpers::init();
@@ -250,12 +274,7 @@ fn main() {
     register_window_class();
 
     let frames_raw = include_bytes_zstd!("assets/boxes.bin", 22);
-    let frames: &[Option<WinCoords>] = unsafe {
-        std::slice::from_raw_parts(
-            frames_raw.as_ptr() as *const _,
-            frames_raw.len() / std::mem::size_of::<WinCoords>(),
-        )
-    };
+    let frames = parse_frames(frames_raw);
     let mut frames_iter = frames.iter();
     // println!("{:?}", frames);
 
@@ -300,75 +319,94 @@ fn main() {
         let ratio_x = usable_x as f32 / BASE_WIDTH as f32;
         let ratio_y = usable_y as f32 / BASE_HEIGHT as f32;
 
-        SetTimer(None, 1, 16, None); // nyquist 30fps
+        let timer = SetTimer(None, TIMER_ID, FRAME_TIMER_MS, None);
+        assert!(timer != 0, "failed to create frame timer");
 
-        'outer: loop {
+        let mut reached_end = false;
+
+        loop {
             let mut msg: MSG = std::mem::zeroed();
+            let status = GetMessageA(&mut msg, None, 0, 0).0;
+            assert!(status != -1, "GetMessageA failed");
 
-            //if there was a windows message
-            // note: mouse moves only trigger when over the window
-            while PeekMessageA(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                if msg.message == WM_QUIT {
-                    println!("WM_QUIT");
-                    break;
-                } else if msg.message == WM_TIMER {
-                    let current_tick = clock.time().ticks;
-                    // nothing to do yet, eg next_tick = 1, current_tick = 0
-                    if next_tick > current_tick {
-                        continue;
-                    }
-                    // skip any frames that we missed, eg next_tick = 2, current_tick = 3
-                    while current_tick > next_tick {
-                        loop {
-                            let Some(val) = frames_iter.next() else {
-                                break 'outer;
-                            };
-                            let Some(_coords) = val else {
-                                break;
-                            };
-                        }
-                        next_tick += 1;
-                    }
+            if status == 0 {
+                println!("WM_QUIT");
+                break;
+            }
 
-                    // process the current tick
-                    let mut windows = collection.wins.iter_mut();
+            if msg.message == WM_TIMER {
+                let current_tick = clock.time().ticks;
+                // nothing to do yet, eg next_tick = 1, current_tick = 0
+                if next_tick > current_tick {
+                    continue;
+                }
+
+                // skip any frames that we missed, eg next_tick = 2, current_tick = 3
+                while current_tick > next_tick {
                     loop {
                         let Some(val) = frames_iter.next() else {
-                            break 'outer;
-                        };
-                        let Some(coords) = val else {
+                            reached_end = true;
                             break;
                         };
-
-                        let win = windows.next().unwrap();
-                        // windows have padding, cbf working out exactly what
-                        const FUDGE_X: i32 = 15;
-                        const FUDGE_Y: i32 = 8;
-                        win.set_pos(
-                            (coords.x as f32 * ratio_x) as i32,
-                            (coords.y as f32 * ratio_y) as i32,
-                        );
-                        win.set_sz(
-                            (coords.w.get() as f32 * ratio_x) as i32 + FUDGE_X,
-                            (coords.h.get() as f32 * ratio_y) as i32 + FUDGE_Y,
-                        );
-                        win.set_visible(true);
+                        let Some(_coords) = val else {
+                            break;
+                        };
                     }
 
-                    // hide the rest
-                    for win in windows {
-                        win.set_visible(false);
+                    if reached_end {
+                        break;
                     }
-
-                    collection.draw();
-                    // WindowCollection::draw_many(&mut [&mut collection, &mut normal_collection]);
 
                     next_tick += 1;
                 }
 
-                TranslateMessage(&msg);
-                DispatchMessageA(&msg);
+                if reached_end {
+                    break;
+                }
+
+                // process the current tick
+                let mut windows = collection.wins.iter_mut();
+                loop {
+                    let Some(val) = frames_iter.next() else {
+                        reached_end = true;
+                        break;
+                    };
+                    let Some(coords) = val else {
+                        break;
+                    };
+
+                    let win = windows.next().unwrap();
+                    win.set_pos(
+                        (coords.x as f32 * ratio_x) as i32,
+                        (coords.y as f32 * ratio_y) as i32,
+                    );
+                    win.set_sz(
+                        (coords.w.get() as f32 * ratio_x) as i32,
+                        (coords.h.get() as f32 * ratio_y) as i32,
+                    );
+                    win.set_visible(true);
+                }
+
+                if reached_end {
+                    break;
+                }
+
+                // hide the rest
+                for win in windows {
+                    win.set_visible(false);
+                }
+
+                collection.draw();
+                next_tick += 1;
             }
+
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+
+        KillTimer(None, TIMER_ID);
+        for win in &collection.wins {
+            DestroyWindow(win.hwnd);
         }
     }
 }
