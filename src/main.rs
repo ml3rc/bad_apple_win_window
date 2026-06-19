@@ -274,7 +274,7 @@ fn main() {
     register_window_class();
 
     let frames_raw = include_bytes_zstd!("assets/boxes.bin", 22);
-    let frames = parse_frames(frames_raw);
+    let frames = parse_frames(&frames_raw);
     let mut frames_iter = frames.iter();
     // println!("{:?}", frames);
 
