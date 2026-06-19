@@ -157,10 +157,6 @@ impl DeferredWindow {
             } else {
                 SWP_HIDEWINDOW
             };
-        } else {
-            // if we're showing a hidden MessageBox or Progress window, we need
-            // to redraw or it is often stale
-            flags |= SWP_NOREDRAW;
         }
 
         self.pos_stale = false;
